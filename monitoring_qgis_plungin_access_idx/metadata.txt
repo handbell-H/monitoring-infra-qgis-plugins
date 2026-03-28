@@ -1,0 +1,15 @@
+[general]
+name=충족수준 분석
+qgisMinimumVersion=3.0
+description=격자별 접근성 거리 기반으로 시군구 단위 충족수준을 산출하고 부문별로 표준화·평균합니다.
+version=1.0.1
+author=손종혁 (국토연구원 국토모니터링연구센터)
+email=
+about=격자별 접근성 거리 SHP를 불러와 시설별 거리 기준으로 이진화하고, 부문 내 50% 이상 충족 격자 비율을 시군구 단위로 집계합니다. 선택한 방법으로 표준화한 뒤 부문별 충족수준을 계산하며, 결과는 시군구 단위 SHP로 저장됩니다.
+tracker=
+repository=
+tags=accessibility,충족수준,grid,standardization,시군구,geopandas
+homepage=
+category=Vector
+experimental=False
+deprecated=False

@@ -1,0 +1,15 @@
+[general]
+name=공급수준 분석 (GPD)
+qgisMinimumVersion=3.0
+description=시군구 단위 시설 공급수준을 산출하고 부문별로 표준화·평균합니다. (geopandas 기반 고속)
+version=1.0.4
+author=손종혁 (국토연구원 국토모니터링연구센터)
+email=
+about=geopandas를 활용해 Point SHP(시설 위치)와 인구 SHP(시군구 경계)를 이용해 시설별 1천인당 시설 수를 산출하고, 선택한 방법으로 표준화한 뒤 부문별 평균 공급수준을 계산합니다. 결과는 시군구 단위 SHP로 저장됩니다.
+tracker=
+repository=
+tags=supply,공급수준,facility,standardization,시군구,geopandas
+homepage=
+category=Vector
+experimental=False
+deprecated=False

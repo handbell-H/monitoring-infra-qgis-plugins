@@ -1,0 +1,15 @@
+[general]
+name=생활인프라 편리성 종합지수
+qgisMinimumVersion=3.0
+description=공급수준·향유수준·충족수준을 부문별 가중 합산하여 생활인프라 편리성 종합지수를 산출합니다.
+version=1.0.0
+author=손종혁 (국토연구원 국토모니터링연구센터)
+email=
+about=공급수준(2번)·향유수준(3번)·충족수준(4번) 분석 결과 SHP를 불러와 부문별 가중 합산으로 5개 편리성 지수를 산출하고, 이를 다시 가중 합산하여 생활인프라 편리성 종합지수(0~100점)를 계산합니다.
+tracker=
+repository=
+tags=composite,생활인프라,편리성,종합지수,시군구
+homepage=
+category=Vector
+experimental=False
+deprecated=False

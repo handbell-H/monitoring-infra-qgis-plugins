@@ -1,0 +1,24 @@
+# 데이터 폴더
+predata/
+output/
+
+# zip 배포 파일
+*.zip
+
+# 구버전 / 비GPD 플러그인
+monitoring_qgis_plungin_supply_index/
+monitoring_qgis_plungin_living_infra/
+monitoring_qgis_plungin_living_infra_gpd/
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# QGIS 임시 파일
+*.qgs~
+*.qgz~
+
+# OS
+.DS_Store
+Thumbs.db

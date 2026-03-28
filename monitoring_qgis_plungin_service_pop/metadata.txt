@@ -1,0 +1,15 @@
+[general]
+name=향유수준 분석
+qgisMinimumVersion=3.0
+description=시군구 단위 서비스권역 내 인구비율 기반 향유수준을 산출하고 부문별로 표준화·평균합니다.
+version=1.0.0
+author=손종혁 (국토연구원 국토모니터링연구센터)
+email=
+about=시군구 단위 서비스권역 내 인구비율(value_r) SHP를 불러와 부문별로 분류하고, 선택한 방법으로 표준화한 뒤 부문별 평균 향유수준을 계산합니다. 결과는 시군구 단위 SHP로 저장됩니다.
+tracker=
+repository=
+tags=service,향유수준,population,standardization,시군구
+homepage=
+category=Vector
+experimental=False
+deprecated=False
