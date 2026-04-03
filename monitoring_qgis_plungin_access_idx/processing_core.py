@@ -8,6 +8,7 @@ import math
 import json
 from functools import reduce
 
+import numpy as np
 import geopandas as gpd
 import pandas as pd
 
@@ -122,6 +123,27 @@ def _eng_col(display_name, fallback, used):
     return col
 
 
+def _log_transform(s: pd.Series, method: str) -> pd.Series:
+    """
+    method:
+      'ln'              → ln(x+1)             [오른꼬리]
+      'log10'           → log10(x+1)           [오른꼬리]
+      'reflected_ln'    → ln(max+1-x)          [왼꼬리: 반사 후 로그]
+      'reflected_log10' → log10(max+1-x)       [왼꼬리: 반사 후 로그]
+    반사변환 시 반사값 최솟값 = 1이므로 +1 불필요.
+    """
+    if method == 'ln':
+        return np.log1p(s)
+    elif method == 'log10':
+        return np.log10(s + 1)
+    elif method == 'reflected_ln':
+        return np.log(s.max() + 1 - s)
+    elif method == 'reflected_log10':
+        return np.log10(s.max() + 1 - s)
+    else:
+        return s.copy()
+
+
 def _standardize_series(s, method):
     if method == 'minmax':
         mn, mx = s.min(), s.max()
@@ -129,22 +151,23 @@ def _standardize_series(s, method):
     elif method == 'zscore':
         mean, sd = s.mean(), s.std(ddof=0)
         return (s - mean) / sd if sd > 0 else pd.Series(0.0, index=s.index)
+    elif method == 'tscore':
+        mean, sd = s.mean(), s.std(ddof=0)
+        return 50.0 + 10.0 * (s - mean) / sd if sd > 0 else pd.Series(50.0, index=s.index)
     elif method == 'percentile':
         return s.rank(method='average') / len(s)
     else:
         return s.copy()
 
 
-def run_pipeline(scan_results, sgg_shp, sgg_col, std_method, output_dir, log_fn=print):
+def compute_rat(scan_results, sgg_col, log_fn=print):
     """
-    scan_results : list of {filepath, sector, display_name, threshold}
-    sgg_shp      : 시군구 경계 SHP 경로
-    sgg_col      : 시군구 식별 컬럼명
-    std_method   : 'minmax' | 'zscore' | 'percentile' | 'none'
-    output_dir   : 출력 폴더
+    1~4단계: SHP 읽기 → 이진화 → 충족격자 판정 → 시군구별 충족 격자 비율 산출
+    반환: (sgg_df, fac_meta, sec_meta)
+      sgg_df   : 시군구별 _rat 컬럼 포함 DataFrame
+      fac_meta : 시설 메타 리스트
+      sec_meta : 부문 메타 리스트
     """
-    os.makedirs(output_dir, exist_ok=True)
-
     # ── 1. 영문 컬럼명 할당
     used_cols = set()
     fac_meta = []
@@ -234,12 +257,77 @@ def run_pipeline(scan_results, sgg_shp, sgg_col, std_method, output_dir, log_fn=
         sgg_df[sm['col'] + '_ok'] = ok_count.astype(int)
         sgg_df[sm['col'] + '_rat'] = (ok_count / sgg_total).round(4)
 
-    # ── 6. 표준화
-    log_fn(f"\n[5단계] 표준화 ({std_method})")
+    log_fn("충족 격자 비율 산출 완료.")
+    return sgg_df, fac_meta, sec_meta
+
+
+def finalize_pipeline(sgg_df, fac_meta, sec_meta, sgg_shp, sgg_col,
+                      std_method, output_dir, sector_log_transforms=None, log_fn=print):
+    """
+    5~7단계: 로그 변환 → 표준화 → SHP 저장
+    sgg_df, fac_meta, sec_meta: compute_rat() 반환값
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── 6. 부문별 분포 통계 출력 → 로그 변환 → 표준화
+    _slx = sector_log_transforms or {}
+    _rec_labels = {
+        'none': '변환 없음', 'ln': '자연로그',
+        'log10': '상용로그', 'reflected_ln': '반사 자연로그', 'reflected_log10': '반사 상용로그',
+    }
+
+    log_fn(f"\n[5단계] 부문별 로그 변환 / 표준화 ({std_method})")
+    log_fn("[분포 통계]  부문명          N    평균    최대    왜도")
+
     for sm in sec_meta:
+        s = sgg_df[sm['col'] + '_rat'].fillna(0.0)
+        skew = float(s.skew())
+        if skew > 2.0:    rec = 'log10'
+        elif skew > 1.0:  rec = 'ln'
+        elif skew < -2.0: rec = 'reflected_log10'
+        elif skew < -1.0: rec = 'reflected_ln'
+        else:             rec = 'none'
+
+        lt = _slx.get(sm['name'], 'none')
+        note = '' if lt == rec else f'  (권장: {_rec_labels[rec]})'
+        flag = '  ▶로그 권장' if skew > 1.0 else ('  ▶반사로그 권장' if skew < -1.0 else '')
+        log_fn(
+            f"  {sm['name']:<10}  "
+            f"{len(s):3d}  {float(s.mean()):6.3f}  {float(s.max()):6.3f}  {skew:+.2f}{flag}"
+        )
+        sm['log_transform'] = lt
+
+        # 로그 변환
+        if lt != 'none':
+            sgg_df[sm['col'] + '_log'] = _log_transform(s, lt)
+            src_col = sm['col'] + '_log'
+            log_fn(f"  {sm['name']}: 로그 변환 ({lt}){note}")
+        else:
+            src_col = sm['col'] + '_rat'
+            if note:
+                log_fn(f"  {sm['name']}: 변환 없음{note}")
+
+        # 표준화
         sgg_df[sm['col'] + '_std'] = _standardize_series(
-            sgg_df[sm['col'] + '_rat'], std_method
+            sgg_df[src_col].fillna(0.0), std_method
         ).round(4)
+
+        # 반사변환 시 방향 역전 복원
+        if lt in ('reflected_ln', 'reflected_log10'):
+            col = sm['col'] + '_std'
+            if std_method == 'minmax':
+                sgg_df[col] = 1.0 - sgg_df[col]
+            elif std_method == 'zscore':
+                sgg_df[col] = -sgg_df[col]
+            elif std_method == 'tscore':
+                sgg_df[col] = 100.0 - sgg_df[col]
+            elif std_method == 'percentile':
+                sgg_df[col] = 1.0 - sgg_df[col]
+            elif std_method == 'none':
+                mn, mx = sgg_df[col].min(), sgg_df[col].max()
+                sgg_df[col] = mx + mn - sgg_df[col]
+            log_fn(f"  {sm['name']}: 방향 역전 복원 완료")
+
         log_fn(f"  {sm['name']}: 표준화 완료")
 
     sgg_df = sgg_df.reset_index()

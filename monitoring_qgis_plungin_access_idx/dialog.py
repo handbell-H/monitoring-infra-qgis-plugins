@@ -13,12 +13,33 @@ from qgis.core import QgsProject, QgsVectorLayer
 
 from .processing_core import (
     DEFAULT_SECTORS, detect_sector, get_default_threshold,
-    extract_facility_name, run_pipeline,
+    extract_facility_name, compute_rat, finalize_pipeline,
 )
 
 
 # ── 백그라운드 워커 ──────────────────────────────────────────
+class RatWorker(QThread):
+    """충족 격자 비율 산출 (compute_rat) 전용 워커"""
+    log      = pyqtSignal(str)
+    finished = pyqtSignal(object)  # (sgg_df, fac_meta, sec_meta)
+    error    = pyqtSignal(str)
+
+    def __init__(self, scan_results, sgg_col):
+        super().__init__()
+        self.scan_results = scan_results
+        self.sgg_col      = sgg_col
+
+    def run(self):
+        try:
+            result = compute_rat(self.scan_results, self.sgg_col, log_fn=self.log.emit)
+            self.finished.emit(result)
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
 class Worker(QThread):
+    """finalize_pipeline 전용 워커"""
     log      = pyqtSignal(str)
     finished = pyqtSignal(str)
     error    = pyqtSignal(str)
@@ -42,14 +63,19 @@ class Worker(QThread):
 class AccessIdxDialog(QDialog):
     def __init__(self, iface, parent=None):
         super().__init__(parent)
-        self.iface           = iface
-        self.worker          = None
-        self._scan_results   = []   # {filepath, sector, display_name, threshold, thr_confirmed}
-        self._auto_sectors   = []
-        self._custom_mode    = False
-        self._row_map        = []   # Tab 2 table: (is_header, scan_idx)
-        self._thr_row_map    = []   # Tab 3 table: (is_header, scan_idx)
-        self._unknown_warned = False  # Tab 3 경고창 1회 표시 여부
+        self.iface              = iface
+        self.worker             = None
+        self.rat_worker         = None
+        self._scan_results      = []   # {filepath, sector, display_name, threshold, thr_confirmed}
+        self._auto_sectors      = []
+        self._custom_mode       = False
+        self._row_map           = []   # Tab 2 table: (is_header, scan_idx)
+        self._thr_row_map       = []   # Tab 3 table: (is_header, scan_idx)
+        self._unknown_warned    = False
+        self._sector_log_combos = {}   # sector_name → QComboBox (Tab 4)
+        self._sgg_df            = None  # compute_rat 결과
+        self._fac_meta          = None
+        self._sec_meta          = None
 
         self.setWindowTitle("충족수준 분석")
         self.setMinimumWidth(720)
@@ -64,7 +90,8 @@ class AccessIdxDialog(QDialog):
         self.tabs.addTab(self._tab1(), "1단계: 데이터 입력")
         self.tabs.addTab(self._tab2(), "2단계: 부문 분류")
         self.tabs.addTab(self._tab3(), "3단계: 거리 기준")
-        self.tabs.addTab(self._tab4(), "4단계: 계산")
+        self.tabs.addTab(self._tab4(), "4단계: 로그 변환")
+        self.tabs.addTab(self._tab5(), "5단계: 계산")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tabs)
 
@@ -231,8 +258,44 @@ class AccessIdxDialog(QDialog):
         w.setLayout(layout)
         return w
 
-    # ── Tab 4 ──────────────────────────────────────────────
+    # ── Tab 4: 로그 변환 ──────────────────────────────────────
     def _tab4(self):
+        w = QWidget()
+        layout = QVBoxLayout()
+
+        info = QLabel(
+            "3단계 거리기준 확정 후 산출된 충족 격자 비율의 분포 통계입니다.\n"
+            "왜도 > 1: 오른꼬리 → 로그 권장  |  왜도 < -1: 왼꼬리 → 반사로그 권장"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.table_log = QTableWidget()
+        self.table_log.setColumnCount(5)
+        self.table_log.setHorizontalHeaderLabels(["부문명", "N", "평균", "왜도", "로그 변환"])
+        self.table_log.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, 5):
+            self.table_log.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table_log.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_log.verticalHeader().setVisible(False)
+        layout.addWidget(self.table_log)
+
+        btn_row = QHBoxLayout()
+        btn_reset_log = QPushButton("권장값으로 초기화")
+        btn_reset_log.clicked.connect(self._reset_log_transforms)
+        btn_confirm_log = QPushButton("변환 확정  →  5단계")
+        btn_confirm_log.setMinimumHeight(32)
+        btn_confirm_log.clicked.connect(self._confirm_log_transforms)
+        btn_row.addWidget(btn_reset_log)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_confirm_log)
+        layout.addLayout(btn_row)
+
+        w.setLayout(layout)
+        return w
+
+    # ── Tab 5: 계산 ──────────────────────────────────────────
+    def _tab5(self):
         w = QWidget()
         layout = QVBoxLayout()
         layout.setSpacing(12)
@@ -243,6 +306,7 @@ class AccessIdxDialog(QDialog):
         self.combo_std.addItems([
             "Min-Max 정규화  (0 ~ 1)",
             "Z-score 표준화",
+            "T점수  (50 + 10Z)",
             "백분위 순위  (Percentile Rank)",
             "표준화 없음  (원값 그대로)",
         ])
@@ -256,7 +320,9 @@ class AccessIdxDialog(QDialog):
             "② 시설별 거리 기준으로 이진화  (≤기준 → 1, 초과 → 0)\n"
             "③ 부문별 합산  →  50% 이상 충족 격자 판정\n"
             "④ 시군구별 충족 격자 비율 산출\n"
-            "⑤ 표준화 후 시군구 경계 SHP와 병합하여 저장"
+            "⑤ 4단계에서 설정한 부문별 로그 변환 적용\n"
+            "   반사로그 선택 시: 표준화 후 방향 자동 역전 복원\n"
+            "⑥ 표준화 후 시군구 경계 SHP와 병합하여 저장"
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -272,6 +338,8 @@ class AccessIdxDialog(QDialog):
 
     # ── Tab 전환 콜백 ─────────────────────────────────────
     def _on_tab_changed(self, idx):
+        if idx == 3 and self._scan_results:
+            self._refresh_log_table()
         if idx == 2 and self._scan_results:
             self._refresh_threshold_table()
             # 미인식 시설이 있을 때 최초 1회 경고
@@ -541,12 +609,106 @@ class AccessIdxDialog(QDialog):
                 "거리 기준(km) 셀을 더블클릭하여 값을 확인·설정한 후 진행하세요."
             )
             return
-        self._log("거리 기준 확정.")
+        self._log("거리 기준 확정.  충족 격자 비율 산출 중...")
+
+        sgg_col = self.combo_sgg.currentText()
+        self._progress = QProgressDialog("충족 격자 비율 산출 중...", None, 0, 0, self)
+        self._progress.setWindowTitle("계산 중")
+        self._progress.setWindowModality(Qt.WindowModal)
+        self._progress.setMinimumWidth(280)
+        self._progress.setCancelButton(None)
+        self._progress.show()
+
+        self.rat_worker = RatWorker(list(self._scan_results), sgg_col)
+        self.rat_worker.log.connect(self._log)
+        self.rat_worker.finished.connect(self._on_rat_done)
+        self.rat_worker.error.connect(self._on_rat_error)
+        self.rat_worker.start()
+
+    def _on_rat_done(self, result):
+        self._close_progress()
+        self._sgg_df, self._fac_meta, self._sec_meta = result
+        self._log("충족 격자 비율 산출 완료.")
+        self._refresh_log_table()
         self.tabs.setCurrentIndex(3)
 
+    def _on_rat_error(self, msg):
+        self._close_progress()
+        self._log(f"[오류]\n{msg}")
+
     # ── Tab 4 동작 ────────────────────────────────────────
+    _LOG_KEYS = ['none', 'ln', 'log10', 'reflected_ln', 'reflected_log10']
+    _LOG_LABELS = [
+        '변환 없음',
+        '자연로그  ln(x+1)',
+        '상용로그  log10(x+1)',
+        '반사 자연로그  ln(max+1-x)',
+        '반사 상용로그  log10(max+1-x)',
+    ]
+
+    def _refresh_log_table(self):
+        if self._sec_meta is None or self._sgg_df is None:
+            return
+
+        self.table_log.setRowCount(len(self._sec_meta))
+        prev = {sec: combo.currentIndex() for sec, combo in self._sector_log_combos.items()}
+        self._sector_log_combos = {}
+
+        for row, sm in enumerate(self._sec_meta):
+            # 부문명
+            self.table_log.setItem(row, 0, QTableWidgetItem('  ' + sm['name']))
+
+            # 통계
+            s = self._sgg_df[sm['col'] + '_rat'].fillna(0.0)
+            n    = len(s)
+            mean = float(s.mean())
+            skew = float(s.skew())
+
+            self.table_log.setItem(row, 1, QTableWidgetItem(str(n)))
+            self.table_log.setItem(row, 2, QTableWidgetItem(f"{mean:.3f}"))
+            skew_item = QTableWidgetItem(f"{skew:+.2f}")
+            if abs(skew) > 1.0:
+                skew_item.setForeground(QColor('#c62828'))
+            self.table_log.setItem(row, 3, skew_item)
+
+            # 권장 로그 변환
+            if skew > 2.0:    rec_idx = 2  # log10
+            elif skew > 1.0:  rec_idx = 1  # ln
+            elif skew < -2.0: rec_idx = 4  # reflected_log10
+            elif skew < -1.0: rec_idx = 3  # reflected_ln
+            else:              rec_idx = 0  # none
+
+            combo = QComboBox()
+            for label in self._LOG_LABELS:
+                combo.addItem(label)
+            combo.setCurrentIndex(prev.get(sm['name'], rec_idx))
+            self.table_log.setCellWidget(row, 4, combo)
+            self._sector_log_combos[sm['name']] = combo
+
+    def _reset_log_transforms(self):
+        if self._sec_meta is None or self._sgg_df is None:
+            return
+        for sm in self._sec_meta:
+            combo = self._sector_log_combos.get(sm['name'])
+            if combo is None:
+                continue
+            s = self._sgg_df[sm['col'] + '_rat'].fillna(0.0)
+            skew = float(s.skew())
+            if skew > 2.0:    rec_idx = 2
+            elif skew > 1.0:  rec_idx = 1
+            elif skew < -2.0: rec_idx = 4
+            elif skew < -1.0: rec_idx = 3
+            else:              rec_idx = 0
+            combo.setCurrentIndex(rec_idx)
+        self._log("로그 변환 권장값으로 초기화")
+
+    def _confirm_log_transforms(self):
+        self._log("로그 변환 설정 확정.")
+        self.tabs.setCurrentIndex(4)
+
+    # ── Tab 5 동작 ────────────────────────────────────────
     def _get_std_method(self):
-        return ['minmax', 'zscore', 'percentile', 'none'][self.combo_std.currentIndex()]
+        return ['minmax', 'zscore', 'tscore', 'percentile', 'none'][self.combo_std.currentIndex()]
 
     def _run(self):
         if not self._scan_results:
@@ -579,6 +741,15 @@ class AccessIdxDialog(QDialog):
             QMessageBox.warning(self, "경고", "시군구 식별 컬럼을 선택하세요.")
             return
 
+        if self._sgg_df is None:
+            QMessageBox.warning(self, "경고", "3단계에서 거리 기준을 확정하여 충족 격자 비율을 먼저 산출하세요.")
+            self.tabs.setCurrentIndex(2)
+            return
+
+        sector_log_transforms = {
+            sec: self._LOG_KEYS[combo.currentIndex()]
+            for sec, combo in self._sector_log_combos.items()
+        }
         std_method = self._get_std_method()
         self._log(f"\n=== 계산 시작 (표준화: {std_method}) ===")
         self.btn_run.setEnabled(False)
@@ -591,8 +762,10 @@ class AccessIdxDialog(QDialog):
         self._progress.show()
 
         self.worker = Worker(
-            run_pipeline,
-            list(self._scan_results), sgg_shp, sgg_col, std_method, output_dir,
+            finalize_pipeline,
+            self._sgg_df, self._fac_meta, self._sec_meta,
+            sgg_shp, sgg_col, std_method, output_dir,
+            sector_log_transforms=sector_log_transforms,
         )
         self.worker.log.connect(self._log)
         self.worker.finished.connect(self._on_done)

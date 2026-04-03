@@ -209,12 +209,25 @@ class SupplyIndexDialog(QDialog):
         layout = QVBoxLayout()
         layout.setSpacing(12)
 
+        log_box = QGroupBox("로그 변환  (1천인당 시설 수에 적용)")
+        log_lay = QVBoxLayout()
+        self.combo_log = QComboBox()
+        self.combo_log.addItems([
+            "변환 없음  (원값 그대로)",
+            "자연로그  ln(x + 1)",
+            "상용로그  log10(x + 1)",
+        ])
+        log_lay.addWidget(self.combo_log)
+        log_box.setLayout(log_lay)
+        layout.addWidget(log_box)
+
         std_box = QGroupBox("표준화 방법")
         std_lay = QVBoxLayout()
         self.combo_std = QComboBox()
         self.combo_std.addItems([
             "Min-Max 정규화  (0 ~ 1)",
             "Z-score 표준화",
+            "T점수  (50 + 10Z)",
             "백분위 순위  (Percentile Rank)",
             "표준화 없음  (원값 그대로)",
         ])
@@ -225,8 +238,9 @@ class SupplyIndexDialog(QDialog):
         info = QLabel(
             "계산 순서\n"
             "① 시설별로 1천인당 시설 수 산출  (시군구 단위 공간조인)\n"
-            "② 선택한 방법으로 표준화\n"
-            "③ 부문 내 시설별 표준화 값의 단순 평균 → 부문 공급수준"
+            "② 로그 변환 적용  (선택 시 _log 컬럼 생성)\n"
+            "③ 선택한 방법으로 표준화\n"
+            "④ 부문 내 시설별 표준화 값의 단순 평균 → 부문 공급수준"
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -417,8 +431,11 @@ class SupplyIndexDialog(QDialog):
         self.tabs.setCurrentIndex(2)
 
     # ── Tab 3 동작 ────────────────────────────────────────
+    def _get_log_transform(self):
+        return ['none', 'ln', 'log10'][self.combo_log.currentIndex()]
+
     def _get_std_method(self):
-        return ['minmax', 'zscore', 'percentile', 'none'][self.combo_std.currentIndex()]
+        return ['minmax', 'zscore', 'tscore', 'percentile', 'none'][self.combo_std.currentIndex()]
 
     def _run(self):
         if not self._scan_results:
@@ -441,8 +458,9 @@ class SupplyIndexDialog(QDialog):
             QMessageBox.warning(self, "경고", "시군구 컬럼과 인구 컬럼을 선택하세요.")
             return
 
+        log_transform = self._get_log_transform()
         std_method = self._get_std_method()
-        self._log(f"\n=== 계산 시작 (표준화: {std_method}) ===")
+        self._log(f"\n=== 계산 시작 (로그: {log_transform} / 표준화: {std_method}) ===")
         self.btn_run.setEnabled(False)
 
         self._progress = QProgressDialog("계산 중...", None, 0, 0, self)
@@ -456,6 +474,7 @@ class SupplyIndexDialog(QDialog):
             run_pipeline,
             list(self._scan_results), pop_shp, sgg_col, pop_col,
             std_method, output_dir,
+            log_transform=log_transform,
         )
         self.worker.log.connect(self._log)
         self.worker.finished.connect(self._on_done)

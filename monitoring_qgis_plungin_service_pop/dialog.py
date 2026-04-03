@@ -13,7 +13,7 @@ from qgis.core import QgsProject, QgsVectorLayer
 
 from .processing_core import (
     DEFAULT_SECTORS, detect_sector, load_shp_columns, run_pipeline,
-    extract_facility_name,
+    extract_facility_name, scan_stats,
 )
 
 
@@ -42,12 +42,14 @@ class Worker(QThread):
 class ServicePopDialog(QDialog):
     def __init__(self, iface, parent=None):
         super().__init__(parent)
-        self.iface         = iface
-        self.worker        = None
-        self._scan_results = []
-        self._auto_sectors = []
-        self._custom_mode  = False
-        self._row_map      = []
+        self.iface          = iface
+        self.worker         = None
+        self._scan_results  = []
+        self._auto_sectors  = []
+        self._stats_list    = []
+        self._log_combo_map = {}
+        self._custom_mode   = False
+        self._row_map       = []
 
         self.setWindowTitle("향유수준 분석")
         self.setMinimumWidth(700)
@@ -61,7 +63,8 @@ class ServicePopDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._tab1(), "1단계: 데이터 입력")
         self.tabs.addTab(self._tab2(), "2단계: 부문 분류")
-        self.tabs.addTab(self._tab3(), "3단계: 계산")
+        self.tabs.addTab(self._tab3(), "3단계: 로그 변환")
+        self.tabs.addTab(self._tab4(), "4단계: 계산")
         layout.addWidget(self.tabs)
 
         log_box = QGroupBox("로그")
@@ -186,8 +189,44 @@ class ServicePopDialog(QDialog):
         w.setLayout(layout)
         return w
 
-    # ── Tab 3 ──────────────────────────────────────────────
+    # ── Tab 3: 로그 변환 ──────────────────────────────────────
     def _tab3(self):
+        w = QWidget()
+        layout = QVBoxLayout()
+
+        info = QLabel(
+            "시설별 분포 통계를 바탕으로 로그 변환 방법을 확인·수정하세요.\n"
+            "왜도 > 1: 오른꼬리 → 로그 권장  |  왜도 < -1: 왼꼬리 → 반사로그 권장"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.table_log = QTableWidget()
+        self.table_log.setColumnCount(5)
+        self.table_log.setHorizontalHeaderLabels(["시설명", "N", "평균", "왜도", "로그 변환"])
+        self.table_log.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, 5):
+            self.table_log.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table_log.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_log.verticalHeader().setVisible(False)
+        layout.addWidget(self.table_log)
+
+        btn_row = QHBoxLayout()
+        btn_reset_log = QPushButton("권장값으로 초기화")
+        btn_reset_log.clicked.connect(self._reset_log_transforms)
+        btn_confirm_log = QPushButton("변환 확정  →  4단계")
+        btn_confirm_log.setMinimumHeight(32)
+        btn_confirm_log.clicked.connect(self._confirm_log_transforms)
+        btn_row.addWidget(btn_reset_log)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_confirm_log)
+        layout.addLayout(btn_row)
+
+        w.setLayout(layout)
+        return w
+
+    # ── Tab 4: 계산 ──────────────────────────────────────────
+    def _tab4(self):
         w = QWidget()
         layout = QVBoxLayout()
         layout.setSpacing(12)
@@ -198,6 +237,7 @@ class ServicePopDialog(QDialog):
         self.combo_std.addItems([
             "Min-Max 정규화  (0 ~ 1)",
             "Z-score 표준화",
+            "T점수  (50 + 10Z)",
             "백분위 순위  (Percentile Rank)",
             "표준화 없음  (원값 그대로)",
         ])
@@ -208,8 +248,10 @@ class ServicePopDialog(QDialog):
         info = QLabel(
             "계산 순서\n"
             "① 시설별 서비스권역 내 인구비율(value_r) 읽기\n"
-            "② 선택한 방법으로 표준화\n"
-            "③ 부문 내 시설별 표준화 값의 단순 평균 → 부문 향유수준"
+            "② 3단계에서 설정한 시설별 로그 변환 적용\n"
+            "   반사로그 선택 시: 표준화 후 방향 자동 역전 복원\n"
+            "③ 선택한 방법으로 표준화\n"
+            "④ 부문 내 시설별 표준화 값의 단순 평균 → 부문 향유수준"
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -268,6 +310,22 @@ class ServicePopDialog(QDialog):
             f"감지: {len(files)}개 파일  |  자동 매핑: {matched}개  |  미분류: {unmatched}개"
         )
         self._log(f"스캔 완료: {len(files)}개 (매핑 {matched} / 미분류 {unmatched})")
+
+        # ── 시설별 분포 통계 계산 및 권장 로그 변환 설정
+        self._stats_list = []
+        for entry in self._scan_results:
+            st = scan_stats(entry['filepath'])
+            self._stats_list.append(st)
+            rec = 'none'
+            if st:
+                skew = st['skew']
+                if skew > 2.0:    rec = 'log10'
+                elif skew > 1.0:  rec = 'ln'
+                elif skew < -2.0: rec = 'reflected_log10'
+                elif skew < -1.0: rec = 'reflected_ln'
+            entry['log_transform']     = rec
+            entry['log_transform_rec'] = rec
+        self._log("시설별 분포 통계 계산 완료  (3단계에서 로그 변환 확인)")
 
         self._custom_mode = False
         self._update_custom_btn()
@@ -382,9 +440,85 @@ class ServicePopDialog(QDialog):
                 return
 
         self._log("부문 분류 확정 완료.")
+        self._refresh_log_table()
         self.tabs.setCurrentIndex(2)
 
     # ── Tab 3 동작 ────────────────────────────────────────
+    _LOG_KEYS = ['none', 'ln', 'log10', 'reflected_ln', 'reflected_log10']
+    _LOG_LABELS = [
+        '변환 없음',
+        '자연로그  ln(x+1)',
+        '상용로그  log10(x+1)',
+        '반사 자연로그  ln(max+1-x)',
+        '반사 상용로그  log10(max+1-x)',
+    ]
+
+    def _refresh_log_table(self):
+        groups = {}
+        for idx, entry in enumerate(self._scan_results):
+            groups.setdefault(entry['sector'], []).append(idx)
+
+        total_rows = sum(1 + len(v) for v in groups.values())
+        self.table_log.setRowCount(total_rows)
+        self._log_combo_map = {}
+
+        HDR_BG   = QColor('#1565c0')
+        HDR_FG   = QColor('#ffffff')
+        hdr_font = QFont()
+        hdr_font.setBold(True)
+
+        tbl_row = 0
+        for sec, indices in groups.items():
+            for c in range(5):
+                item = QTableWidgetItem(f"  {sec}   ({len(indices)}개)" if c == 0 else '')
+                item.setFont(hdr_font)
+                item.setBackground(HDR_BG)
+                item.setForeground(HDR_FG)
+                item.setFlags(Qt.ItemIsEnabled)
+                self.table_log.setItem(tbl_row, c, item)
+            self.table_log.setSpan(tbl_row, 0, 1, 5)
+            self.table_log.setRowHeight(tbl_row, 26)
+            tbl_row += 1
+
+            for scan_idx in indices:
+                entry = self._scan_results[scan_idx]
+                st = self._stats_list[scan_idx] if scan_idx < len(self._stats_list) else None
+
+                self.table_log.setItem(tbl_row, 0, QTableWidgetItem('    ' + entry['display_name']))
+
+                if st:
+                    self.table_log.setItem(tbl_row, 1, QTableWidgetItem(str(st['n'])))
+                    self.table_log.setItem(tbl_row, 2, QTableWidgetItem(f"{st['mean']:.3f}"))
+                    skew_item = QTableWidgetItem(f"{st['skew']:+.2f}")
+                    if abs(st['skew']) > 1.0:
+                        skew_item.setForeground(QColor('#c62828'))
+                    self.table_log.setItem(tbl_row, 3, skew_item)
+                else:
+                    for c in range(1, 4):
+                        self.table_log.setItem(tbl_row, c, QTableWidgetItem('-'))
+
+                combo = QComboBox()
+                for label in self._LOG_LABELS:
+                    combo.addItem(label)
+                lt = entry.get('log_transform', 'none')
+                combo.setCurrentIndex(self._LOG_KEYS.index(lt) if lt in self._LOG_KEYS else 0)
+                self.table_log.setCellWidget(tbl_row, 4, combo)
+                self._log_combo_map[scan_idx] = combo
+                tbl_row += 1
+
+    def _confirm_log_transforms(self):
+        for scan_idx, combo in self._log_combo_map.items():
+            self._scan_results[scan_idx]['log_transform'] = self._LOG_KEYS[combo.currentIndex()]
+        self._log("로그 변환 설정 확정.")
+        self.tabs.setCurrentIndex(3)
+
+    def _reset_log_transforms(self):
+        for scan_idx, combo in self._log_combo_map.items():
+            rec = self._scan_results[scan_idx].get('log_transform_rec', 'none')
+            combo.setCurrentIndex(self._LOG_KEYS.index(rec) if rec in self._LOG_KEYS else 0)
+        self._log("로그 변환 권장값으로 초기화")
+
+    # ── Tab 4 동작 ────────────────────────────────────────
     def _run(self):
         if not self._scan_results:
             QMessageBox.warning(self, "경고", "먼저 1단계 스캔을 완료하세요.")
@@ -395,8 +529,8 @@ class ServicePopDialog(QDialog):
             QMessageBox.warning(self, "경고", "출력 폴더를 선택하세요.")
             return
 
-        sgg_col    = self.combo_sgg.currentText()
-        std_method = ['minmax', 'zscore', 'percentile', 'none'][self.combo_std.currentIndex()]
+        sgg_col       = self.combo_sgg.currentText()
+        std_method = ['minmax', 'zscore', 'tscore', 'percentile', 'none'][self.combo_std.currentIndex()]
 
         self._log(f"\n=== 계산 시작 (표준화: {std_method}) ===")
         self.btn_run.setEnabled(False)

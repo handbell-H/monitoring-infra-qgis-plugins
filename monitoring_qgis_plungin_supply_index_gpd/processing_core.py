@@ -6,6 +6,7 @@ import os
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
 import geopandas as gpd
 import pandas as pd
 from qgis.core import QgsVectorLayer
@@ -108,6 +109,17 @@ def load_shp_columns(shp_path):
     return [f.name() for f in layer.fields()]
 
 
+# ── 로그 변환
+def _log_transform(s: pd.Series, method: str) -> pd.Series:
+    """method: 'ln' → ln(x+1),  'log10' → log10(x+1),  'none' → 원값"""
+    if method == 'ln':
+        return np.log1p(s)
+    elif method == 'log10':
+        return np.log10(s + 1)
+    else:
+        return s.copy()
+
+
 # ── 표준화
 def _standardize_series(s: pd.Series, method: str) -> pd.Series:
     if method == 'minmax':
@@ -121,6 +133,12 @@ def _standardize_series(s: pd.Series, method: str) -> pd.Series:
         if sd > 0:
             return (s - mean) / sd
         return pd.Series(0.0, index=s.index)
+
+    elif method == 'tscore':
+        mean, sd = s.mean(), s.std(ddof=0)
+        if sd > 0:
+            return 50.0 + 10.0 * (s - mean) / sd
+        return pd.Series(50.0, index=s.index)
 
     elif method == 'percentile':
         return s.rank(method='average') / len(s)
@@ -164,7 +182,7 @@ def _count_facility(pf, fac_idx, total, pop_crs, pop_sgg, sgg_col, log_fn):
 
 # ── 메인 파이프라인
 def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
-                 std_method, output_dir, log_fn=print):
+                 std_method, output_dir, log_transform='none', log_fn=print):
     os.makedirs(output_dir, exist_ok=True)
 
     # ── 1. 인구/경계 레이어 로드
@@ -215,8 +233,8 @@ def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
         cnt_series = count_results.get(fm['idx'], pd.Series(dtype=int))
         result[fm['col'] + '_cnt'] = result.index.map(cnt_series).fillna(0).astype(int)
 
-    # ── 5. 표준화
-    log_fn(f"\n[2단계] 표준화 ({std_method})")
+    # ── 5. 1천인당 시설 수 → 로그 변환 → 표준화
+    log_fn(f"\n[2단계] 로그 변환 ({log_transform})  /  표준화 ({std_method})")
 
     # 공급수준 (1천인당)
     for fm in fac_meta:
@@ -226,11 +244,18 @@ def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
             result[cnt_col] / result[pop_col].replace(0, float('nan')) * 1000.0
         ).fillna(0.0)
 
-    # 표준화
+    # 로그 변환 (none이 아닐 때만 _log 컬럼 생성)
+    if log_transform != 'none':
+        for fm in fac_meta:
+            result[fm['col'] + '_log'] = _log_transform(
+                result[fm['col'] + '_sup'], log_transform
+            )
+            log_fn(f"  {fm['name']}: 로그 변환 완료")
+
+    # 표준화 (로그 변환값 우선, 없으면 원값)
     for fm in fac_meta:
-        sup_col = fm['col'] + '_sup'
-        std_col = fm['col'] + '_std'
-        result[std_col] = _standardize_series(result[sup_col], std_method)
+        src_col = (fm['col'] + '_log') if log_transform != 'none' else (fm['col'] + '_sup')
+        result[fm['col'] + '_std'] = _standardize_series(result[src_col], std_method)
         log_fn(f"  {fm['name']}: 표준화 완료")
 
     # ── 6. 부문 평균
@@ -244,14 +269,15 @@ def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
         result[s_col + '_avg'] = result[std_cols].mean(axis=1)
         log_fn(f"  {sec_name}: {len(std_cols)}개 시설 평균")
 
-    # ── 7. 컬럼 순서 정렬: 인구SHP 원본 컬럼 → 개수 묶음 → 공급수준 묶음 → 표준화 묶음 → 부문평균
+    # ── 7. 컬럼 순서 정렬: 인구SHP 원본 컬럼 → 개수 → 1천인당 → [로그] → 표준화 → 부문평균
     cnt_cols = [fm['col'] + '_cnt' for fm in fac_meta]
     sup_cols = [fm['col'] + '_sup' for fm in fac_meta]
+    log_cols = [fm['col'] + '_log' for fm in fac_meta] if log_transform != 'none' else []
     std_cols = [fm['col'] + '_std' for fm in fac_meta]
     avg_cols = [sm['col'] + '_avg' for sm in sec_meta]
 
     extra_pop_cols = [c for c in pop_gdf.columns if c not in ('geometry', sgg_col)]
-    ordered_cols = extra_pop_cols + cnt_cols + sup_cols + std_cols + avg_cols
+    ordered_cols = extra_pop_cols + cnt_cols + sup_cols + log_cols + std_cols + avg_cols
     result = result[ordered_cols].round(4).reset_index()
 
     # ── 8. geometry 병합 후 SHP 저장
@@ -267,6 +293,7 @@ def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
     meta = {
         'sgg_col': sgg_col,
         'pop_col': pop_col,
+        'log_transform': log_transform,
         'std_method': std_method,
         'facilities': fac_meta,
         'sectors': sec_meta,

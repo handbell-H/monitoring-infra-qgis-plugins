@@ -7,6 +7,7 @@ import os
 import re
 from functools import reduce
 
+import numpy as np
 import geopandas as gpd
 import pandas as pd
 from qgis.core import QgsVectorLayer
@@ -116,6 +117,72 @@ def load_shp_columns(shp_path):
     return [f.name() for f in layer.fields()]
 
 
+def scan_stats(filepath, value_col='value_r'):
+    """SHP 파일에서 value_col 기초 통계 반환. 실패 시 None."""
+    try:
+        gdf = gpd.read_file(filepath)
+        if value_col not in gdf.columns:
+            return None
+        s = pd.to_numeric(gdf[value_col], errors='coerce').dropna()
+        if s.empty:
+            return None
+        return {
+            'n':    len(s),
+            'mean': float(s.mean()),
+            'max':  float(s.max()),
+            'skew': float(s.skew()),
+        }
+    except Exception:
+        return None
+
+
+def recommend_log_transform(stats_list):
+    """
+    시설별 통계 목록으로 로그 변환 권장 방법 반환.
+      평균 왜도 > 2.0   → 'log10'
+      평균 왜도 > 1.0   → 'ln'
+      평균 왜도 < -2.0  → 'reflected_log10'
+      평균 왜도 < -1.0  → 'reflected_ln'
+      그 외             → 'none'
+    """
+    skews = [st['skew'] for st in stats_list if st is not None]
+    if not skews:
+        return 'none'
+    mean_skew = sum(skews) / len(skews)
+    if mean_skew > 2.0:
+        return 'log10'
+    elif mean_skew > 1.0:
+        return 'ln'
+    elif mean_skew < -2.0:
+        return 'reflected_log10'
+    elif mean_skew < -1.0:
+        return 'reflected_ln'
+    else:
+        return 'none'
+
+
+def _log_transform(s: pd.Series, method: str) -> pd.Series:
+    """
+    method:
+      'ln'              → ln(x+1)             [오른꼬리]
+      'log10'           → log10(x+1)           [오른꼬리]
+      'reflected_ln'    → ln(max+1-x)          [왼꼬리: 반사 후 로그]
+      'reflected_log10' → log10(max+1-x)       [왼꼬리: 반사 후 로그]
+      'none'            → 원값
+    반사변환 시 반사값 최솟값 = 1이므로 +1 불필요.
+    """
+    if method == 'ln':
+        return np.log1p(s)
+    elif method == 'log10':
+        return np.log10(s + 1)
+    elif method == 'reflected_ln':
+        return np.log(s.max() + 1 - s)
+    elif method == 'reflected_log10':
+        return np.log10(s.max() + 1 - s)
+    else:
+        return s.copy()
+
+
 def _standardize_series(s, method):
     if method == 'minmax':
         mn, mx = s.min(), s.max()
@@ -123,6 +190,9 @@ def _standardize_series(s, method):
     elif method == 'zscore':
         mean, sd = s.mean(), s.std(ddof=0)
         return (s - mean) / sd if sd > 0 else pd.Series(0.0, index=s.index)
+    elif method == 'tscore':
+        mean, sd = s.mean(), s.std(ddof=0)
+        return 50.0 + 10.0 * (s - mean) / sd if sd > 0 else pd.Series(50.0, index=s.index)
     elif method == 'percentile':
         return s.rank(method='average') / len(s)
     else:
@@ -148,6 +218,7 @@ def run_pipeline(scan_results, sgg_col, std_method, output_dir, log_fn=print):
             'sector': pf['sector'],
             'name': pf['display_name'],
             'filepath': pf['filepath'],
+            'log_transform': pf.get('log_transform', 'none'),
         })
 
     # ── 2. SHP 읽기 + reduce로 병합
@@ -181,16 +252,44 @@ def run_pipeline(scan_results, sgg_col, std_method, output_dir, log_fn=print):
         [base_geo] + fac_dfs
     )
 
-    # ── 3. 표준화
-    log_fn(f"\n[2단계] 표준화 ({std_method})")
+    # ── 3. 시설별 로그 변환 → 표준화
+    log_fn(f"\n[2단계] 시설별 로그 변환 / 표준화 ({std_method})")
     val_cols = [fm['col'] for fm in fac_meta]
-    std_cols = [fm['col'] + '_std' for fm in fac_meta]
 
     for fm in fac_meta:
+        lt = fm['log_transform']
+
+        if lt != 'none':
+            merged[fm['col'] + '_log'] = _log_transform(
+                merged[fm['col']].fillna(0.0), lt
+            )
+            src_col = fm['col'] + '_log'
+            log_fn(f"  {fm['name']}: 로그 변환 ({lt})")
+        else:
+            src_col = fm['col']
+
         merged[fm['col'] + '_std'] = _standardize_series(
-            merged[fm['col']].fillna(0.0), std_method
+            merged[src_col].fillna(0.0), std_method
         )
+
+        # 반사변환 시 방향 역전 복원
+        if lt in ('reflected_ln', 'reflected_log10'):
+            col = fm['col'] + '_std'
+            if std_method == 'minmax':
+                merged[col] = 1.0 - merged[col]
+            elif std_method == 'zscore':
+                merged[col] = -merged[col]
+            elif std_method == 'tscore':
+                merged[col] = 100.0 - merged[col]
+            elif std_method == 'percentile':
+                merged[col] = 1.0 - merged[col]
+            elif std_method == 'none':
+                mn, mx = merged[col].min(), merged[col].max()
+                merged[col] = mx + mn - merged[col]
+
         log_fn(f"  {fm['name']}: 표준화 완료")
+
+    std_cols = [fm['col'] + '_std' for fm in fac_meta]
 
     # ── 4. 부문 평균
     log_fn("\n[3단계] 부문별 평균 산출")
@@ -206,10 +305,11 @@ def run_pipeline(scan_results, sgg_col, std_method, output_dir, log_fn=print):
         avg_cols.append(s_col + '_avg')
         log_fn(f"  {sec_name}: {len(fac_std)}개 시설 평균")
 
-    # ── 5. 컬럼 순서 정렬: 원값 묶음 → 표준화 묶음 → 부문평균
+    # ── 5. 컬럼 순서 정렬: 원값 → [로그] → 표준화 → 부문평균
+    log_cols = [fm['col'] + '_log' for fm in fac_meta if fm['log_transform'] != 'none']
     meta_cols = [c for c in [sgg_col, 'sgg_nm_k', 'sido_cd', 'sido_nm_k']
                  if c in merged.columns]
-    ordered = meta_cols + val_cols + std_cols + avg_cols + ['geometry']
+    ordered = meta_cols + val_cols + log_cols + std_cols + avg_cols + ['geometry']
     result = gpd.GeoDataFrame(
         merged[[c for c in ordered if c in merged.columns]],
         geometry='geometry', crs=base_geo.crs
