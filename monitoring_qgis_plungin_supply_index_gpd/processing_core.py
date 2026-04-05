@@ -52,7 +52,6 @@ SECTOR_COL_MAP = {
     '미분류':   'misc',
 }
 
-# ── 디폴트 부문 매핑
 DEFAULT_SECTORS = {
     '교육학습': [
         '도서관', '어린이집', '유치원', '초등학교',
@@ -109,13 +108,18 @@ def load_shp_columns(shp_path):
     return [f.name() for f in layer.fields()]
 
 
-# ── 로그 변환
+# ── 로그 변환 (반사 변환 포함)
 def _log_transform(s: pd.Series, method: str) -> pd.Series:
-    """method: 'ln' → ln(x+1),  'log10' → log10(x+1),  'none' → 원값"""
     if method == 'ln':
         return np.log1p(s)
     elif method == 'log10':
         return np.log10(s + 1)
+    elif method == 'reflected_ln':
+        mx = s.max()
+        return np.log1p(mx - s)
+    elif method == 'reflected_log10':
+        mx = s.max()
+        return np.log10(mx - s + 1)
     else:
         return s.copy()
 
@@ -148,12 +152,7 @@ def _standardize_series(s: pd.Series, method: str) -> pd.Series:
 
 
 # ── 단일 시설 공간조인 (스레드에서 실행)
-def _count_facility(pf, fac_idx, total, pop_crs, pop_sgg, sgg_col, log_fn):
-    """
-    geopandas sjoin으로 포인트 → 시군구 카운팅.
-    pop_sgg: pop GeoDataFrame의 [sgg_col, geometry] 슬라이스 (읽기 전용 공유)
-    반환: (fac_idx, Series: sgg_key -> count)
-    """
+def _count_facility(pf, fac_idx, total, sgg_crs, sgg_slim, sgg_col, log_fn):
     try:
         pt_gdf = gpd.read_file(pf['filepath'])
     except Exception as e:
@@ -164,14 +163,12 @@ def _count_facility(pf, fac_idx, total, pop_crs, pop_sgg, sgg_col, log_fn):
         log_fn(f"  [{fac_idx+1}/{total}] {pf['sector']} / {pf['display_name']} → 0개")
         return fac_idx, pd.Series(dtype=int)
 
-    # CRS 통일
-    if pt_gdf.crs != pop_crs:
-        pt_gdf = pt_gdf.to_crs(pop_crs)
+    if pt_gdf.crs != sgg_crs:
+        pt_gdf = pt_gdf.to_crs(sgg_crs)
 
-    # sjoin: within (포인트가 폴리곤 안에 있는지)
     joined = gpd.sjoin(
         pt_gdf[['geometry']],
-        pop_sgg,
+        sgg_slim,
         how='left',
         predicate='within',
     )
@@ -180,22 +177,54 @@ def _count_facility(pf, fac_idx, total, pop_crs, pop_sgg, sgg_col, log_fn):
     return fac_idx, counts
 
 
-# ── 메인 파이프라인
-def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
-                 std_method, output_dir, log_transform='none', log_fn=print):
-    os.makedirs(output_dir, exist_ok=True)
+# ── 1단계: 거주 km² 집계 + 시설별 공간조인
+def compute_sup(point_files_info, sgg_shp, grid_shp, grid_pop_col,
+                sgg_col, log_fn=print):
+    # ── SGG SHP 로드
+    log_fn("시군구 경계 SHP 로드 중...")
+    sgg_gdf = gpd.read_file(sgg_shp)
+    sgg_crs = sgg_gdf.crs
+    log_fn(f"  → 시군구 {len(sgg_gdf)}개 로드 완료")
 
-    # ── 1. 인구/경계 레이어 로드
-    log_fn("인구(시군구 경계) SHP 로드 중...")
-    pop_gdf = gpd.read_file(pop_shp)
-    pop_gdf[pop_col] = pd.to_numeric(pop_gdf[pop_col], errors='coerce').fillna(0.0)
-    pop_crs = pop_gdf.crs
-    log_fn(f"  → 시군구 {len(pop_gdf)}개 로드 완료")
+    # ── 격자 SHP → 거주 격자 필터 → centroid → 시군구 공간조인
+    log_fn("\n[1단계] 거주지 1km² 면적 산출 (인구 격자 기반)")
+    grid_gdf = gpd.read_file(grid_shp)
+    grid_gdf[grid_pop_col] = pd.to_numeric(
+        grid_gdf[grid_pop_col], errors='coerce'
+    ).fillna(0)
+    log_fn(f"  격자 전체: {len(grid_gdf):,}개")
 
-    # sjoin용 슬라이스 (읽기 전용 공유)
-    pop_sgg = pop_gdf[[sgg_col, 'geometry']].copy()
+    # ── 1. 격자 폴리곤 → centroid 포인트 (전체)
+    grid_pts = gpd.GeoDataFrame(
+        grid_gdf[[grid_pop_col]],
+        geometry=grid_gdf.geometry.centroid,
+        crs=grid_gdf.crs,
+    )
 
-    # ── 2. fac_meta 구성
+    # ── 2. 인구 > 0 포인트만 필터
+    grid_pts = grid_pts[grid_pts[grid_pop_col] > 0].copy()
+    log_fn(f"  인구 > 0 격자(포인트): {len(grid_pts):,}개")
+
+    # ── 3. 시군구 공간조인
+    if grid_pts.crs != sgg_crs:
+        grid_pts = grid_pts.to_crs(sgg_crs)
+
+    joined_grid = gpd.sjoin(
+        grid_pts,
+        sgg_gdf[[sgg_col, 'geometry']],
+        how='inner',
+        predicate='within',
+    )
+
+    # ── 4. 시군구 cd 기준 그룹바이
+    res_km2 = joined_grid.groupby(sgg_col).size()
+    log_fn(f"  시군구별 거주 km² 산출 완료 (평균 {res_km2.mean():.1f} km²/시군구)")
+
+    # ── 5. 시군구 경계에 붙이기
+    result = sgg_gdf[[sgg_col]].set_index(sgg_col).copy()
+    result['res_km2'] = result.index.map(res_km2).fillna(0).astype(int)
+
+    # ── fac_meta 구성
     used_cols = set()
     fac_meta = []
     for i, pf in enumerate(point_files_info):
@@ -206,18 +235,19 @@ def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
             'filepath': pf['filepath'],
         })
 
-    # ── 3. 병렬 공간조인
-    log_fn(f"\n[1단계] 시설별 1천인당 시설 수 산출")
+    # ── 2단계: 병렬 시설 공간조인
+    log_fn(f"\n[2단계] 시설별 공간조인")
     n = len(point_files_info)
     max_workers = min(4, n)
     log_fn(f"  병렬 처리: {n}개 파일 / {max_workers} 스레드")
 
-    count_results = {}  # fac_idx → Series(sgg_key → count)
+    sgg_slim = sgg_gdf[[sgg_col, 'geometry']].copy()
+    count_results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
                 _count_facility,
-                pf, i, n, pop_crs, pop_sgg, sgg_col, log_fn,
+                pf, i, n, sgg_crs, sgg_slim, sgg_col, log_fn,
             ): i
             for i, pf in enumerate(point_files_info)
         }
@@ -225,41 +255,65 @@ def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
             fac_idx, counts = future.result()
             count_results[fac_idx] = counts
 
-    # ── 4. 결과 DataFrame 구성 (인덱스: sgg_col, 인구 SHP 전체 컬럼 보존)
-    result = pop_gdf.drop(columns=['geometry']).set_index(sgg_col).copy()
-
-    # 개수 컬럼
+    # ── 개수 컬럼 + 거주 1km²당 시설 수
     for fm in fac_meta:
         cnt_series = count_results.get(fm['idx'], pd.Series(dtype=int))
         result[fm['col'] + '_cnt'] = result.index.map(cnt_series).fillna(0).astype(int)
 
-    # ── 5. 1천인당 시설 수 → 로그 변환 → 표준화
-    log_fn(f"\n[2단계] 로그 변환 ({log_transform})  /  표준화 ({std_method})")
-
-    # 공급수준 (1천인당)
     for fm in fac_meta:
         cnt_col = fm['col'] + '_cnt'
         sup_col = fm['col'] + '_sup'
-        result[sup_col] = (
-            result[cnt_col] / result[pop_col].replace(0, float('nan')) * 1000.0
-        ).fillna(0.0)
+        cnt = result[cnt_col].fillna(0)
+        res = result['res_km2'].fillna(0)
+        result[sup_col] = (cnt / res.replace(0, float('nan'))).fillna(0.0)
+        s = result[sup_col]
+        log_fn(f"  {fm['name']}: _sup 범위 [{s.min():.4f} ~ {s.max():.4f}], 평균 {s.mean():.4f}")
 
-    # 로그 변환 (none이 아닐 때만 _log 컬럼 생성)
-    if log_transform != 'none':
-        for fm in fac_meta:
-            result[fm['col'] + '_log'] = _log_transform(
-                result[fm['col'] + '_sup'], log_transform
-            )
-            log_fn(f"  {fm['name']}: 로그 변환 완료")
+    return result, fac_meta
 
-    # 표준화 (로그 변환값 우선, 없으면 원값)
+
+# ── 2단계: 로그 변환 + 표준화 + SHP 저장
+def finalize_supply(sgg_df, fac_meta, sgg_shp, sgg_col, std_method,
+                    output_dir, fac_log_transforms=None, log_fn=print):
+    os.makedirs(output_dir, exist_ok=True)
+
+    result = sgg_df.copy()
+    _flx = fac_log_transforms or {}
+
+    log_fn(f"\n[3단계] 시설별 로그 변환 + 표준화 ({std_method})")
+
     for fm in fac_meta:
-        src_col = (fm['col'] + '_log') if log_transform != 'none' else (fm['col'] + '_sup')
-        result[fm['col'] + '_std'] = _standardize_series(result[src_col], std_method)
-        log_fn(f"  {fm['name']}: 표준화 완료")
+        lt = _flx.get(fm['name'], 'none')
+        fm['log_transform'] = lt
+        sup_col = fm['col'] + '_sup'
 
-    # ── 6. 부문 평균
-    log_fn("\n[3단계] 부문별 평균 산출")
+        if lt != 'none':
+            result[fm['col'] + '_log'] = _log_transform(result[sup_col], lt)
+            src = result[fm['col'] + '_log']
+        else:
+            src = result[sup_col]
+
+        std_val = _standardize_series(src, std_method)
+
+        # 반사 변환 후 역전 보정
+        if lt in ('reflected_ln', 'reflected_log10'):
+            if std_method == 'minmax':
+                std_val = 1 - std_val
+            elif std_method == 'zscore':
+                std_val = -std_val
+            elif std_method == 'tscore':
+                std_val = 100 - std_val
+            elif std_method == 'percentile':
+                std_val = 1 - std_val
+            else:  # none
+                mn, mx = std_val.min(), std_val.max()
+                std_val = mx + mn - std_val
+
+        result[fm['col'] + '_std'] = std_val
+        log_fn(f"  {fm['name']}: 로그={lt}, 표준화={std_method} 완료")
+
+    # ── 부문 평균
+    log_fn("\n[4단계] 부문별 평균 산출")
     sectors_order = list(dict.fromkeys(fm['sector'] for fm in fac_meta))
     sec_meta = []
     for j, sec_name in enumerate(sectors_order):
@@ -269,34 +323,33 @@ def run_pipeline(point_files_info, pop_shp, sgg_col, pop_col,
         result[s_col + '_avg'] = result[std_cols].mean(axis=1)
         log_fn(f"  {sec_name}: {len(std_cols)}개 시설 평균")
 
-    # ── 7. 컬럼 순서 정렬: 인구SHP 원본 컬럼 → 개수 → 1천인당 → [로그] → 표준화 → 부문평균
+    # ── 컬럼 순서 정렬
     cnt_cols = [fm['col'] + '_cnt' for fm in fac_meta]
     sup_cols = [fm['col'] + '_sup' for fm in fac_meta]
-    log_cols = [fm['col'] + '_log' for fm in fac_meta] if log_transform != 'none' else []
+    log_cols = [fm['col'] + '_log' for fm in fac_meta
+                if fm.get('log_transform', 'none') != 'none']
     std_cols = [fm['col'] + '_std' for fm in fac_meta]
     avg_cols = [sm['col'] + '_avg' for sm in sec_meta]
 
-    extra_pop_cols = [c for c in pop_gdf.columns if c not in ('geometry', sgg_col)]
-    ordered_cols = extra_pop_cols + cnt_cols + sup_cols + log_cols + std_cols + avg_cols
+    ordered_cols = ['res_km2'] + cnt_cols + sup_cols + log_cols + std_cols + avg_cols
+    ordered_cols = [c for c in ordered_cols if c in result.columns]
     result = result[ordered_cols].round(4).reset_index()
 
-    # ── 8. geometry 병합 후 SHP 저장
+    # ── geometry 병합 후 SHP 저장
     log_fn("\n결과 SHP 생성 중...")
-    result_gdf = pop_gdf[['geometry', sgg_col]].merge(result, on=sgg_col, how='left')
-    result_gdf = gpd.GeoDataFrame(result_gdf, geometry='geometry', crs=pop_crs)
+    sgg_gdf = gpd.read_file(sgg_shp)
+    result_gdf = sgg_gdf[['geometry', sgg_col]].merge(result, on=sgg_col, how='left')
+    result_gdf = gpd.GeoDataFrame(result_gdf, geometry='geometry', crs=sgg_gdf.crs)
 
     out_shp = os.path.join(output_dir, 'supply_index.shp')
     result_gdf.to_file(out_shp, encoding='utf-8')
     log_fn(f"저장: {out_shp}  ({len(result_gdf):,}행)")
 
-    # 메타 JSON
     meta = {
-        'sgg_col': sgg_col,
-        'pop_col': pop_col,
-        'log_transform': log_transform,
+        'sgg_col':    sgg_col,
         'std_method': std_method,
         'facilities': fac_meta,
-        'sectors': sec_meta,
+        'sectors':    sec_meta,
     }
     meta_path = os.path.join(output_dir, 'supply_meta.json')
     with open(meta_path, 'w', encoding='utf-8') as f:
